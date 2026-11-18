@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>环境监测小时观测数据平台</title>
+<style>
+:root { --line:#d8dee4; --bg:#f6f8fa; --ok:#1a7f37; --bad:#cf222e; --ink:#1f2328; --brand:#0b3d66; }
+* { box-sizing: border-box; }
+body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin:0; color:var(--ink); background:var(--bg); }
+header { background:var(--brand); color:#fff; padding:14px 22px; }
+header h1 { margin:0; font-size:19px; }
+header p { margin:4px 0 0; font-size:12px; opacity:.85; }
+main { max-width:1080px; margin:18px auto; padding:0 16px 40px; }
+section { background:#fff; border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin-bottom:16px; }
+h2 { font-size:15px; margin:0 0 10px; }
+table { border-collapse:collapse; width:100%; font-size:13px; margin:6px 0; }
+th,td { border:1px solid var(--line); padding:5px 8px; text-align:left; }
+th { background:var(--bg); }
+button { background:var(--brand); color:#fff; border:0; border-radius:6px; padding:6px 14px; cursor:pointer; font-size:13px; }
+button.ghost { background:#fff; color:var(--brand); border:1px solid var(--brand); padding:3px 10px; }
+button:hover { opacity:.88; }
+input,select { padding:5px 7px; border:1px solid var(--line); border-radius:6px; font-size:13px; }
+.badge { display:inline-block; background:var(--ok); color:#fff; font-size:11px; border-radius:10px; padding:1px 8px; margin-left:6px; vertical-align:middle; }
+.badge.old { background:#6e7781; }
+.ok { color:var(--ok); } .err { color:var(--bad); }
+.msg { margin-top:8px; font-size:13px; }
+.err-list { color:var(--bad); font-size:12px; margin:4px 0 0; }
+.muted { color:#57606a; font-size:12px; }
+.row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:6px 0; }
+code { background:var(--bg); padding:1px 5px; border-radius:4px; }
+details { margin:2px 0 10px; }
+summary { cursor:pointer; }
+.nullcell { color:#9a6700; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>环境监测小时观测数据平台</h1>
+  <p>结构版本化：改名 / 新增可空列 / 整数扩小数 可追溯；旧批次保留原值与原结构；删除列、合并列、缩型一律拒绝；失败操作不影响供数。</p>
+</header>
+<main>
+
+<section id="sec-current">
+  <h2>① 现役结构</h2>
+  <div id="current-box">加载中…</div>
+</section>
+
+<section id="sec-publish">
+  <h2>② 发布结构版本</h2>
+  <div id="publish-box"></div>
+</section>
+
+<section id="sec-upload">
+  <h2>③ 上传观测 CSV</h2>
+  <p class="muted" id="csv-hint"></p>
+  <div class="row">
+    <input type="file" id="csv-file" accept=".csv,text/csv">
+    <button onclick="uploadCsv()">上传</button>
+  </div>
+  <div id="upload-result" class="msg"></div>
+</section>
+
+<section id="sec-query">
+  <h2>④ 查询观测</h2>
+  <div class="row">
+    <label>站号 <input id="q-station" placeholder="如 S01（可空）"></label>
+    <label>起始 <input id="q-from" placeholder="2026-11-18T00:00"></label>
+    <label>截止 <input id="q-to" placeholder="2026-11-18T23:00"></label>
+    <label>视角 <select id="q-version"></select></label>
+    <button onclick="doQuery()">查询</button>
+  </div>
+  <div id="query-result"></div>
+</section>
+
+<section id="sec-versions">
+  <h2>⑤ 版本历史</h2>
+  <div id="versions-box"></div>
+</section>
+
+<section id="sec-batches">
+  <h2>⑥ 批次列表</h2>
+  <div id="batches-box"></div>
+</section>
+
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const state = { current: null, versions: [], batches: [] };
+const TYPE_LABEL = { station:'站号(系统)', hour:'UTC小时(系统)', integer:'整数', float:'小数', text:'文本' };
+
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  let body = null;
+  try { body = await r.json(); } catch(e) {}
+  if(!r.ok){
+    throw { status:r.status, message:(body && body.detail) || ('HTTP ' + r.status), errors:(body && body.errors) || [] };
+  }
+  return body;
+}
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function showErr(el, e){
+  el.innerHTML = '<div class="err">✗ ' + esc(e.message) + '</div>' +
+    ((e.errors && e.errors.length) ? '<ul class="err-list">' + e.errors.map(x => '<li>' + esc(x) + '</li>').join('') + '</ul>' : '');
+}
+
+async function refresh(){
+  try { state.current = await api('/api/versions/current'); } catch(e) { state.current = null; }
+  state.versions = (await api('/api/versions')).versions;
+  state.batches = (await api('/api/batches')).batches;
+  renderCurrent(); renderPublish(); renderVersions(); renderBatches(); renderLensOptions();
+}
+
+function colTable(cols){
+  return '<table><tr><th>#</th><th>列名</th><th>类型</th><th>可空</th><th>列标识</th></tr>' +
+    cols.map(c => '<tr><td>' + (c.position + 1) + '</td><td>' + esc(c.name) + '</td><td>' + TYPE_LABEL[c.type] +
+      '</td><td>' + (c.nullable ? '是' : '否') + '</td><td><code>' + esc(c.column_id) + '</code></td></tr>').join('') +
+    '</table>';
+}
+
+function renderCurrent(){
+  const box = $('current-box');
+  if(!state.current){
+    box.innerHTML = '<p class="muted">尚未发布任何结构版本，请先在「②」发布初版结构。</p>';
+    $('csv-hint').textContent = '';
+    return;
+  }
+  const v = state.current;
+  box.innerHTML = '<p>现役版本 <b>v' + v.version_no + '</b><span class="badge">active</span> ' +
+    '<span class="muted">' + esc(v.created_at) + (v.note ? ' · ' + esc(v.note) : '') + '</span></p>' + colTable(v.columns);
+  $('csv-hint').textContent = 'CSV 表头须与现役结构一致（顺序不限）：' + v.columns.map(c => c.name).join(', ');
+}
+
+/* ---------- 发布 ---------- */
+
+function renderPublish(){
+  const box = $('publish-box');
+  if(!state.current){
+    box.innerHTML =
+      '<p class="muted">初版结构必须包含 1 个站号列与 1 个 UTC 小时列（名称自定），数据列类型可选 整数 / 小数 / 文本。</p>' +
+      '<div class="row"><label>站号列名 <input id="p-station" value="站号"></label>' +
+      '<label>UTC小时列名 <input id="p-hour" value="UTC小时"></label></div>' +
+      '<div id="p-rows"></div>' +
+      '<div class="row"><button class="ghost" onclick="addInitRow()">+ 添加数据列</button></div>' +
+      '<div class="row"><label>备注 <input id="p-note" placeholder="可选"></label>' +
+      '<button onclick="publishInitial()">发布初版结构</button></div>' +
+      '<div id="publish-msg" class="msg"></div>';
+    addInitRow();
+    return;
+  }
+  const v = state.current;
+  box.innerHTML =
+    '<p class="muted">基于现役 v' + v.version_no + ' 演化：直接改「新列名」即改名；整数列可扩为小数；可追加可空新列。' +
+    '删除列、合并列、缩型（小数→整数等）会被拒绝。</p>' +
+    '<table id="p-table"><tr><th>来源列标识</th><th>原列名</th><th>新列名</th><th>类型</th><th></th></tr>' +
+    v.columns.map(carriedRowHtml).join('') + '</table>' +
+    '<div class="row"><button class="ghost" onclick="addNewRow()">+ 新增可空列</button>' +
+    '<label>备注 <input id="p-note" placeholder="可选"></label>' +
+    '<button onclick="publishEvolution()">发布新版本 v' + (v.version_no + 1) + '</button></div>' +
+    '<div id="publish-msg" class="msg"></div>';
+}
+
+function carriedRowHtml(c){
+  let typeCell;
+  if(c.type === 'station' || c.type === 'hour') typeCell = '<span class="muted">' + TYPE_LABEL[c.type] + '</span>';
+  else if(c.type === 'integer') typeCell = '<select data-type><option value="integer" selected>整数</option><option value="float">小数（扩型）</option></select>';
+  else if(c.type === 'float') typeCell = '<select data-type><option value="float" selected>小数</option></select>';
+  else typeCell = '<select data-type><option value="text" selected>文本</option></select>';
+  return '<tr data-source="' + esc(c.column_id) + '"><td><code>' + esc(c.column_id) + '</code></td><td>' + esc(c.name) + '</td>' +
+    '<td><input data-name value="' + esc(c.name) + '"></td><td>' + typeCell + '</td><td class="muted">沿用</td></tr>';
+}
+
+function addNewRow(){
+  const tr = document.createElement('tr');
+  tr.setAttribute('data-source', '');
+  tr.innerHTML = '<td class="muted">（新列）</td><td class="muted">—</td>' +
+    '<td><input data-name placeholder="新列名"></td>' +
+    '<td><select data-type><option value="integer">整数</option><option value="float">小数</option><option value="text">文本</option></select></td>' +
+    '<td><button class="ghost" onclick="this.closest(\'tr\').remove()">移除</button></td>';
+  $('p-table').appendChild(tr);
+}
+
+function addInitRow(){
+  const div = document.createElement('div');
+  div.className = 'row';
+  div.innerHTML = '<input data-name placeholder="数据列名，如 气温">' +
+    '<select data-type><option value="integer">整数</option><option value="float">小数</option><option value="text">文本</option></select>' +
+    '<button class="ghost" onclick="this.parentElement.remove()">移除</button>';
+  $('p-rows').appendChild(div);
+}
+
+async function publishInitial(){
+  const msg = $('publish-msg'); msg.innerHTML = '';
+  const cols = [
+    { role:'station', name: $('p-station').value.trim() },
+    { role:'hour', name: $('p-hour').value.trim() },
+  ];
+  document.querySelectorAll('#p-rows .row').forEach(r => {
+    cols.push({ role:'data', name: r.querySelector('[data-name]').value.trim(), type: r.querySelector('[data-type]').value });
+  });
+  try{
+    await api('/api/versions', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ note: $('p-note').value.trim(), columns: cols }) });
+    await refresh();
+    $('publish-msg') && ($('publish-msg').innerHTML = '<div class="ok">✓ 初版结构已发布</div>');
+  }catch(e){ showErr(msg, e); }
+}
+
+async function publishEvolution(){
+  const msg = $('publish-msg'); msg.innerHTML = '';
+  const cols = [];
+  document.querySelectorAll('#p-table tr[data-source]').forEach(tr => {
+    const source = tr.getAttribute('data-source') || null;
+    const c = { source, name: tr.querySelector('[data-name]').value.trim() };
+    const tsel = tr.querySelector('[data-type]');
+    if(tsel) c.type = tsel.value;
+    if(!source) c.nullable = true;
+    cols.push(c);
+  });
+  try{
+    await api('/api/versions', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ note: $('p-note').value.trim(), columns: cols }) });
+    await refresh();
+    $('publish-msg') && ($('publish-msg').innerHTML = '<div class="ok">✓ 新版本已发布并成为现役版本</div>');
+  }catch(e){ showErr(msg, e); }
+}
+
+/* ---------- 上传 ---------- */
+
+async function uploadCsv(){
+  const msg = $('upload-result'); msg.innerHTML = '';
+  const f = $('csv-file').files[0];
+  if(!f){ msg.innerHTML = '<div class="err">请选择 CSV 文件</div>'; return; }
+  const fd = new FormData(); fd.append('file', f);
+  try{
+    const r = await api('/api/batches', { method:'POST', body: fd });
+    msg.innerHTML = '<div class="ok">✓ 批次 #' + r.batch_id + ' 已按 v' + r.version_no + ' 入库，共 ' + r.row_count + ' 行</div>';
+    await refresh();
+  }catch(e){ showErr(msg, e); }
+}
+
+/* ---------- 查询 ---------- */
+
+function renderLensOptions(){
+  const sel = $('q-version');
+  const cur = sel.value;
+  let opts = '<option value="">现役版本（统一展示全部批次）</option>';
+  state.versions.forEach(v => {
+    opts += '<option value="' + v.version_no + '">历史视角 v' + v.version_no + '（仅该版批次 · 当时列名与原值）</option>';
+  });
+  sel.innerHTML = opts;
+  if([...sel.options].some(o => o.value === cur)) sel.value = cur;
+}
+
+async function doQuery(){
+  const box = $('query-result'); box.innerHTML = '';
+  const p = new URLSearchParams();
+  if($('q-station').value.trim()) p.set('station', $('q-station').value.trim());
+  if($('q-from').value.trim()) p.set('hour_from', $('q-from').value.trim());
+  if($('q-to').value.trim()) p.set('hour_to', $('q-to').value.trim());
+  if($('q-version').value) p.set('version_no', $('q-version').value);
+  try{
+    const d = await api('/api/observations?' + p.toString());
+    const cols = d.version.columns;
+    let h = '<p class="muted">视角：v' + d.version.version_no + '（' + (d.version.status === 'active' ? '现役' : '历史') +
+      '）· 共 ' + d.row_count + ' 行' + (d.truncated ? '（已达上限，结果截断）' : '') + '</p>';
+    if(!d.rows.length){ box.innerHTML = h + '<p class="muted">无匹配数据。</p>'; return; }
+    h += '<table><tr><th>批次</th><th>批次版本</th>' +
+      cols.map(c => '<th>' + esc(c.name) + '<br><span class="muted">' + TYPE_LABEL[c.type] + '</span></th>').join('') + '</tr>';
+    d.rows.forEach(r => {
+      h += '<tr><td>#' + r.batch_id + '</td><td>v' + r.batch_version_no + '</td>' +
+        cols.map(c => {
+          const val = r.values[c.name];
+          return '<td>' + (val === null || val === undefined ? '<span class="nullcell">（空）</span>' : esc(val)) + '</td>';
+        }).join('') + '</tr>';
+    });
+    box.innerHTML = h + '</table>';
+  }catch(e){ showErr(box, e); }
+}
+
+/* ---------- 版本历史 / 批次 ---------- */
+
+function renderVersions(){
+  const box = $('versions-box');
+  if(!state.versions.length){ box.innerHTML = '<p class="muted">暂无版本。</p>'; return; }
+  let h = '';
+  [...state.versions].reverse().forEach(v => {
+    h += '<p><b>v' + v.version_no + '</b>' +
+      (v.status === 'active' ? '<span class="badge">active</span>' : '<span class="badge old">已替换</span>') +
+      ' <span class="muted">' + esc(v.created_at) + (v.note ? ' · ' + esc(v.note) : '') + '</span> ' +
+      '<button class="ghost" onclick="lensTo(' + v.version_no + ')">以此视角查询</button></p>' +
+      '<details><summary class="muted">列结构（' + v.columns.length + ' 列）</summary>' + colTable(v.columns) + '</details>';
+  });
+  box.innerHTML = h;
+}
+function lensTo(v){
+  $('q-version').value = String(v);
+  document.getElementById('sec-query').scrollIntoView({behavior:'smooth'});
+  doQuery();
+}
+
+function renderBatches(){
+  const box = $('batches-box');
+  if(!state.batches.length){ box.innerHTML = '<p class="muted">暂无批次。</p>'; return; }
+  let h = '<table><tr><th>批次</th><th>结构版本</th><th>文件名</th><th>行数</th><th>上传时间</th></tr>';
+  state.batches.forEach(b => {
+    h += '<tr><td>#' + b.id + '</td><td>v' + b.version_no + '</td><td>' + esc(b.filename) +
+      '</td><td>' + b.row_count + '</td><td>' + esc(b.uploaded_at) + '</td></tr>';
+  });
+  box.innerHTML = h + '</table>';
+}
+
+refresh().then(() => { if(state.current) doQuery(); })
+  .catch(e => { $('current-box').innerHTML = '<div class="err">加载失败：' + esc(e.message || e) + '</div>'; });
+</script>
+</body>
+</html>

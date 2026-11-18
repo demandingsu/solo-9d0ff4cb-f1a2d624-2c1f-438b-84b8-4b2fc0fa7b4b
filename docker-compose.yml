@@ -1,0 +1,14 @@
+services:
+  web:
+    build: .
+    image: obs-platform
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /srv/data/obs.db
+    volumes:
+      - obs-data:/srv/data
+    restart: unless-stopped
+
+volumes:
+  obs-data:
