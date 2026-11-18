@@ -1,4 +1,4 @@
-"""结构版本、批次上传、统一查询的核心逻辑。
+"""结构版本、批次上传、优先级归并、统一查询的核心逻辑。
 
 设计要点：
 - 每个逻辑列有稳定标识 column_id（station / hour_utc / c1 / c2 …）。
@@ -6,8 +6,12 @@
 - 观测值按上传时的解析结果原样存入 values_json（{column_id: value}），
   之后任何版本操作都不改写它：旧批次保留原值与原结构；
   新增列在旧行自然为空；整数扩小数不回填、不改数。
-- 发布与上传都先完整校验、再在单个事务里写入；失败整体回滚，
-  现役版本与既有数据不受影响（失败仍按原版本供数）。
+- 发布、上传、调整优先级都先完整校验、再在单个事务里写入；
+  归并结果（merged_hours）与原始观测在同一事务内重算，失败整体回滚，
+  不会出现"批次已入库但归并还是旧的"或"归并写了一半"的状态。
+- 归并以 站号 + UTC 小时 为键，逐列（column_id）取优先级最高的非空值；
+  同一优先级下相同读数只计一次，不同读数记为冲突，该小时不可交付。
+  空值永远不遮盖更低优先级的有效读数。
 """
 from __future__ import annotations
 
@@ -87,9 +91,22 @@ def list_versions(conn) -> list[dict]:
 def list_batches(conn) -> list[dict]:
     rows = conn.execute(
         """
-        SELECT b.id, b.filename, b.row_count, b.uploaded_at, v.version_no
+        SELECT b.id, b.filename, b.row_count, b.priority, b.uploaded_at, v.version_no
         FROM batches b JOIN schema_versions v ON v.id = b.version_id
         ORDER BY b.id
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_batch_priorities(conn) -> list[dict]:
+    """批次及优先级，附带每个批次出现在归并结果中的列数（供页面参考）。"""
+    rows = conn.execute(
+        """
+        SELECT b.id, b.filename, b.row_count, b.priority, b.uploaded_at,
+               v.version_no, v.note
+        FROM batches b JOIN schema_versions v ON v.id = b.version_id
+        ORDER BY b.priority DESC, b.id
         """
     ).fetchall()
     return [dict(r) for r in rows]
@@ -265,6 +282,9 @@ def publish_version(conn, spec) -> dict:
             " VALUES (?,?,?,?,?,?)",
             (vid, c["column_id"], c["name"], c["type"], c["position"], 1 if c["nullable"] else 0),
         )
+    # 换版后归并展示结构随之变化：在同一事务内按新结构重算，
+    # 保证页面上看到的归并结果与现役结构属于同一已提交状态。
+    recompute_all(conn)
     row = conn.execute("SELECT * FROM schema_versions WHERE id=?", (vid,)).fetchone()
     return version_with_columns(conn, dict(row))
 
@@ -273,6 +293,27 @@ def publish_version(conn, spec) -> dict:
 
 _INT_RE = re.compile(r"^[+-]?\d+$")
 _HOUR_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2})(?::(\d{2}))?(?::(\d{2}))?Z?$")
+
+PRIORITY_MIN, PRIORITY_MAX = -1_000_000, 1_000_000
+
+
+def normalize_priority(raw, *, default: int | None = 0) -> int:
+    """批次优先级：整数，数值越大越优先；同级由归并规则处理。"""
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        if default is None:
+            raise DomainError("优先级不能为空")
+        return default
+    if isinstance(raw, bool):
+        raise DomainError("优先级必须是整数")
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str) and _INT_RE.match(raw.strip()):
+        value = int(raw.strip())
+    else:
+        raise DomainError(f"优先级必须是整数，得到 {raw!r}")
+    if not (PRIORITY_MIN <= value <= PRIORITY_MAX):
+        raise DomainError(f"优先级超出范围（{PRIORITY_MIN} ~ {PRIORITY_MAX}）")
+    return value
 
 
 def normalize_hour(raw) -> str:
@@ -314,8 +355,13 @@ def _parse_value(raw, ctype):
     return s, None  # text 原样保留
 
 
-def upload_csv(conn, filename: str, text: str) -> dict:
-    """按现役结构校验并入库。任何一行不合格则整批拒绝，不产生半成品批次。"""
+def upload_csv(conn, filename: str, text: str, priority=0) -> dict:
+    """按现役结构校验并入库。任何一行不合格则整批拒绝，不产生半成品批次。
+
+    入库后在同一事务内立即重算该批涉及的 (站号, 小时) 归并结果；
+    若提交失败，批次与归并结果一起回滚。
+    """
+    priority = normalize_priority(priority)
     active = get_active_version(conn)
     if active is None:
         raise DomainError("尚未发布任何结构版本，请先发布初版结构")
@@ -380,15 +426,330 @@ def upload_csv(conn, filename: str, text: str) -> dict:
     if not rows:
         raise DomainError("CSV 没有数据行")
     cur = conn.execute(
-        "INSERT INTO batches (version_id, filename, row_count, uploaded_at) VALUES (?,?,?,?)",
-        (active["id"], filename, len(rows), _now()),
+        "INSERT INTO batches (version_id, filename, row_count, priority, uploaded_at)"
+        " VALUES (?,?,?,?,?)",
+        (active["id"], filename, len(rows), priority, _now()),
     )
     bid = cur.lastrowid
     conn.executemany(
         "INSERT INTO observations (batch_id, station, hour_utc, values_json) VALUES (?,?,?,?)",
         [(bid, s, h, j) for s, h, j in rows],
     )
-    return {"batch_id": bid, "version_no": active["version_no"], "row_count": len(rows)}
+    hours = sorted({(s, h) for s, h, _ in rows})
+    recompute_hours(conn, hours)
+    return {"batch_id": bid, "version_no": active["version_no"],
+            "row_count": len(rows), "priority": priority}
+
+
+# ---------------------------------------------------------------- 优先级归并
+
+def _is_blank(v) -> bool:
+    """空值：None，或去空白后为空的字符串。0 / False / 空列表以外的读数都算有效。"""
+    if v is None:
+        return True
+    if isinstance(v, str) and v.strip() == "":
+        return True
+    return False
+
+
+def _same_value(a, b) -> bool:
+    """同优先级下的读数比较：数值按数值比（5 与 5.0 视为同一读数），文本按原文。"""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b
+    return type(a) is type(b) and a == b
+
+
+def merge_rows(cols: list[dict], observations: list[dict]) -> dict:
+    """纯函数归并：observations 每项 {batch_id, priority, values:{column_id: v}}。
+
+    返回 {values, sources, conflicts}；values/sources 是 {column_id: ...}。
+    - 逐列取优先级最高的非空值；空值不参与竞争，不遮盖更低优先级的有效读数。
+    - 同一最高优先级内：相同读数只算一次（sources 里记全部来源批次）；
+      不同读数 → 该列冲突，该小时整体不可交付（status=conflict）。
+    - 某列在所有来源中都没有非空值 → values 中为 None，sources 中为 None。
+    """
+    values: dict = {}
+    sources: dict = {}
+    conflicts: dict = {}
+    for c in cols:
+        cid = c["column_id"]
+        if c["type"] in SYSTEM_TYPES:
+            continue
+        candidates = [(o["priority"], o["batch_id"], o["values"].get(cid))
+                      for o in observations
+                      if not _is_blank(o["values"].get(cid))]
+        if not candidates:
+            values[cid] = None
+            sources[cid] = None
+            continue
+        top = max(p[0] for p in candidates)
+        at_top = [(bid, v) for pri, bid, v in candidates if pri == top]
+        at_top.sort(key=lambda x: x[0])
+        distinct: list = []
+        for _, v in at_top:
+            if not any(_same_value(v, d) for d in distinct):
+                distinct.append(v)
+        batch_ids = list(dict.fromkeys(bid for bid, _ in at_top))
+        if len(distinct) == 1:
+            values[cid] = distinct[0]
+            sources[cid] = {
+                "column_id": cid,
+                "priority": top,
+                "batch_ids": batch_ids,
+                "conflict": False,
+            }
+        else:
+            values[cid] = None
+            sources[cid] = None
+            conflicts[cid] = {
+                "column_id": cid,
+                "name": c["name"],
+                "priority": top,
+                "candidates": [
+                    {"batch_id": bid, "value": v}
+                    for bid, v in at_top
+                ],
+                "values": distinct,
+            }
+    return {"values": values, "sources": sources, "conflicts": conflicts}
+
+
+def _observation_rows_for_hours(conn, hours) -> list[dict]:
+    if not hours:
+        return []
+    out: list[dict] = []
+    # 分批按 (station, hour) 取原始观测，避免 N+1，也避开 SQLite 的变量数上限。
+    for start in range(0, len(hours), 400):
+        chunk = hours[start:start + 400]
+        where = " OR ".join("(o.station=? AND o.hour_utc=?)" for _ in chunk)
+        params = [x for pair in chunk for x in pair]
+        rows = conn.execute(
+            f"""
+            SELECT o.id, o.batch_id, o.station, o.hour_utc, o.values_json, b.priority
+            FROM observations o JOIN batches b ON b.id = o.batch_id
+            WHERE {where}
+            ORDER BY o.station, o.hour_utc, b.priority DESC, o.batch_id, o.id
+            """,
+            params,
+        ).fetchall()
+        out.extend(dict(r) for r in rows)
+    return out
+
+
+def recompute_hours(conn, hours) -> int:
+    """在调用方的事务内重算指定 (站号, 小时) 的归并结果，整体替换旧结果。
+
+    归并结果只依赖已提交的原始观测与批次优先级，故与上传/改优先级同事务写入；
+    事务回滚时新结果一并消失，不会留下半套。
+    """
+    hours = list(dict.fromkeys((str(s).strip(), str(h)) for s, h in hours))
+    if not hours:
+        return 0
+    active = get_active_version(conn)
+    cols = version_columns(conn, active["id"]) if active else []
+    has_data_cols = any(c["type"] not in SYSTEM_TYPES for c in cols)
+    rows = _observation_rows_for_hours(conn, hours)
+    by_hour: dict[tuple, list[dict]] = {}
+    for r in rows:
+        key = (r["station"], r["hour_utc"])
+        by_hour.setdefault(key, []).append({
+            "batch_id": r["batch_id"],
+            "priority": r["priority"],
+            "values": json.loads(r["values_json"]),
+        })
+    now = _now()
+    written = 0
+    for key in hours:
+        conn.execute("DELETE FROM merged_hours WHERE station=? AND hour_utc=?", key)
+        obs = by_hour.get(key)
+        if not obs or not has_data_cols:
+            continue
+        result = merge_rows(cols, obs)
+        status = "conflict" if result["conflicts"] else "ok"
+        conn.execute(
+            "INSERT INTO merged_hours (station, hour_utc, status, values_json,"
+            " sources_json, conflicts_json, computed_at) VALUES (?,?,?,?,?,?,?)",
+            (key[0], key[1], status,
+             json.dumps(result["values"], ensure_ascii=False, sort_keys=True),
+             json.dumps(result["sources"], ensure_ascii=False, sort_keys=True),
+             json.dumps(result["conflicts"], ensure_ascii=False, sort_keys=True),
+             now),
+        )
+        written += 1
+    return written
+
+
+def recompute_all(conn) -> int:
+    rows = conn.execute(
+        "SELECT DISTINCT station, hour_utc FROM observations"
+    ).fetchall()
+    return recompute_hours(conn, [(r["station"], r["hour_utc"]) for r in rows])
+
+
+def set_batch_priority(conn, batch_id: int, priority) -> dict:
+    """调整批次优先级并只重算该批次涉及的小时。失败整体回滚，结果仍为旧状态。"""
+    batch = conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+    if batch is None:
+        raise NotFoundError(f"批次 #{batch_id} 不存在")
+    new_priority = normalize_priority(priority, default=None)
+    old_priority = batch["priority"]
+    if new_priority == old_priority:
+        return {"batch_id": batch_id, "priority": old_priority,
+                "previous_priority": old_priority, "recomputed_hours": 0,
+                "changed": False}
+    conn.execute("UPDATE batches SET priority=? WHERE id=?", (new_priority, batch_id))
+    hours = conn.execute(
+        "SELECT DISTINCT station, hour_utc FROM observations WHERE batch_id=?",
+        (batch_id,),
+    ).fetchall()
+    n = recompute_hours(conn, [(r["station"], r["hour_utc"]) for r in hours])
+    return {"batch_id": batch_id, "priority": new_priority,
+            "previous_priority": old_priority, "recomputed_hours": n,
+            "changed": True}
+
+
+# ---------------------------------------------------------------- 归并结果查询
+
+def query_merged(conn, station=None, hour_from=None, hour_to=None,
+                 status=None, limit=1000) -> dict:
+    """每小时一行的归并结果，含各列来源批次与冲突原因。"""
+    active = get_active_version(conn)
+    if active is None:
+        raise NotFoundError("尚未发布任何结构版本")
+    cols = version_columns(conn, active["id"])
+    where, params = [], []
+    if station:
+        where.append("m.station = ?")
+        params.append(station.strip())
+    if hour_from:
+        where.append("m.hour_utc >= ?")
+        params.append(hour_from)
+    if hour_to:
+        where.append("m.hour_utc <= ?")
+        params.append(hour_to)
+    if status:
+        if status not in ("ok", "conflict"):
+            raise DomainError("status 只能是 ok 或 conflict")
+        where.append("m.status = ?")
+        params.append(status)
+    sql = "SELECT * FROM merged_hours m"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY m.station, m.hour_utc LIMIT ?"
+    params.append(limit + 1)
+    fetched = conn.execute(sql, params).fetchall()
+    truncated = len(fetched) > limit
+    fetched = fetched[:limit]
+    batch_meta = {
+        r["id"]: {"filename": r["filename"], "priority": r["priority"],
+                  "version_no": r["version_no"]}
+        for r in conn.execute(
+            "SELECT b.id, b.filename, b.priority, v.version_no FROM batches b"
+            " JOIN schema_versions v ON v.id=b.version_id"
+        )
+    }
+    rows = []
+    for r in fetched:
+        values = json.loads(r["values_json"])
+        sources = json.loads(r["sources_json"])
+        conflicts = json.loads(r["conflicts_json"])
+        out_values, out_sources = {}, {}
+        for c in cols:
+            if c["type"] == "station":
+                out_values[c["name"]] = r["station"]
+                out_sources[c["name"]] = {"system": True}
+            elif c["type"] == "hour":
+                out_values[c["name"]] = r["hour_utc"]
+                out_sources[c["name"]] = {"system": True}
+            else:
+                out_values[c["name"]] = values.get(c["column_id"])
+                src = sources.get(c["column_id"])
+                if src:
+                    src = dict(src)
+                    src["batches"] = [
+                        {"batch_id": bid, **batch_meta.get(bid, {})}
+                        for bid in src.get("batch_ids", [])
+                    ]
+                out_sources[c["name"]] = src
+        out_conflicts = []
+        col_by_id = {c["column_id"]: c for c in cols}
+        for cid, c in conflicts.items():
+            name = col_by_id.get(cid, {}).get("name", c["name"])
+            out_conflicts.append({
+                "column": name,
+                "column_id": cid,
+                "priority": c["priority"],
+                "values": c["values"],
+                "candidates": [
+                    {**cand,
+                     "filename": batch_meta.get(cand["batch_id"], {}).get("filename"),
+                     "version_no": batch_meta.get(cand["batch_id"], {}).get("version_no")}
+                    for cand in c["candidates"]
+                ],
+                "reason": (
+                    f"列「{name}」在最高优先级 {c['priority']} 上出现"
+                    f" {len(c['values'])} 个不同读数，无法判定哪条为准，该小时不可交付"
+                ),
+            })
+        rows.append({
+            "station": r["station"],
+            "hour_utc": r["hour_utc"],
+            "status": r["status"],
+            "deliverable": r["status"] == "ok",
+            "values": out_values,
+            "sources": out_sources,
+            "conflicts": out_conflicts,
+            "computed_at": r["computed_at"],
+        })
+    return {
+        "version": version_with_columns(conn, active),
+        "columns": [{"name": c["name"], "type": c["type"], "column_id": c["column_id"]}
+                    for c in cols],
+        "row_count": len(rows),
+        "truncated": truncated,
+        "rows": rows,
+    }
+
+
+def merged_csv(conn, station=None, hour_from=None, hour_to=None, status=None) -> str:
+    """下载用 CSV：每小时一行，附状态 / 冲突原因 / 各列来源批次。
+
+    冲突小时也输出一行（交付状态=不可交付），方便下游核查而不是静默丢弃。
+    """
+    data = query_merged(conn, station=station, hour_from=hour_from,
+                        hour_to=hour_to, status=status, limit=100000)
+    cols = data["columns"]
+    data_cols = [c for c in cols if c["type"] not in SYSTEM_TYPES]
+    header = ["站号", "UTC小时", "交付状态", "冲突原因"]
+    for c in data_cols:
+        header.append(c["name"])
+    for c in data_cols:
+        header.append(f"{c['name']}·来源批次")
+    for c in data_cols:
+        header.append(f"{c['name']}·来源优先级")
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(header)
+    for row in data["rows"]:
+        line = [row["station"], row["hour_utc"],
+                "可交付" if row["deliverable"] else "冲突·不可交付",
+                "；".join(c["reason"] for c in row["conflicts"])]
+        for c in data_cols:
+            v = row["values"].get(c["name"])
+            line.append("" if v is None else
+                        (json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list))
+                         else v))
+        for c in data_cols:
+            src = row["sources"].get(c["name"])
+            line.append("" if not src else ",".join(
+                f"#{b['batch_id']}" for b in src.get("batches", [])))
+        for c in data_cols:
+            src = row["sources"].get(c["name"])
+            line.append("" if not src else src.get("priority"))
+        writer.writerow(line)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------- 查询
@@ -425,7 +786,7 @@ def query_observations(conn, station=None, hour_from=None, hour_to=None,
         where.append("o.hour_utc <= ?")
         params.append(hour_to)
     sql = (
-        "SELECT o.station, o.hour_utc, o.values_json, o.batch_id, b.version_id "
+        "SELECT o.station, o.hour_utc, o.values_json, o.batch_id, b.version_id, b.priority "
         "FROM observations o JOIN batches b ON b.id = o.batch_id"
     )
     if where:
@@ -450,6 +811,7 @@ def query_observations(conn, station=None, hour_from=None, hour_to=None,
                 values[c["name"]] = stored.get(c["column_id"])  # 旧批次没有该列 → 空值
         rows.append({
             "batch_id": r["batch_id"],
+            "priority": r["priority"],
             "batch_version_no": ver_map.get(r["version_id"]),
             "values": values,
         })

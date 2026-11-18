@@ -4,8 +4,8 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import Body, FastAPI, File, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Body, FastAPI, File, Form, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from . import core
@@ -69,7 +69,10 @@ def api_publish_version(spec: dict = Body(...)):
 
 
 @app.post("/api/batches", status_code=201)
-async def api_upload_batch(file: UploadFile = File(...)):
+async def api_upload_batch(
+    file: UploadFile = File(...),
+    priority: str | None = Form(None),
+):
     raw = await file.read()
     if len(raw) > MAX_CSV_BYTES:
         raise core.DomainError("CSV 文件过大（上限 20MB）")
@@ -77,14 +80,75 @@ async def api_upload_batch(file: UploadFile = File(...)):
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
         raise core.DomainError("CSV 必须是 UTF-8 编码")
+    prio = core.normalize_priority(priority)
     with session() as conn:
-        return core.upload_csv(conn, file.filename or "", text)
+        return core.upload_csv(conn, file.filename or "", text, priority=prio)
 
 
 @app.get("/api/batches")
 def api_list_batches():
     with session() as conn:
         return {"batches": core.list_batches(conn)}
+
+
+@app.get("/api/batches/priorities")
+def api_batch_priorities():
+    with session() as conn:
+        return {"batches": core.list_batch_priorities(conn)}
+
+
+@app.post("/api/batches/{batch_id}/priority")
+def api_set_batch_priority(batch_id: int, spec: dict = Body(...)):
+    with session() as conn:
+        return core.set_batch_priority(conn, batch_id, spec.get("priority"))
+
+
+@app.post("/api/merge/recompute")
+def api_merge_recompute():
+    with session() as conn:
+        return {"recomputed_hours": core.recompute_all(conn)}
+
+
+@app.get("/api/merged")
+def api_merged(
+    station: str | None = None,
+    hour_from: str | None = None,
+    hour_to: str | None = None,
+    status: str | None = None,
+    limit: int = 1000,
+):
+    limit = max(1, min(limit, 10000))
+    hf, ht = _normalize_range(hour_from, hour_to)
+    with session() as conn:
+        return core.query_merged(conn, station=station, hour_from=hf, hour_to=ht,
+                                 status=status or None, limit=limit)
+
+
+@app.get("/api/merged.csv")
+def api_merged_csv(
+    station: str | None = None,
+    hour_from: str | None = None,
+    hour_to: str | None = None,
+    status: str | None = None,
+):
+    hf, ht = _normalize_range(hour_from, hour_to)
+    with session() as conn:
+        text = core.merged_csv(conn, station=station, hour_from=hf,
+                               hour_to=ht, status=status or None)
+    filename = "merged_hourly.csv"
+    return Response(
+        content=text.encode("utf-8-sig"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _normalize_range(hour_from, hour_to):
+    try:
+        return (core.normalize_hour(hour_from) if hour_from else None,
+                core.normalize_hour(hour_to) if hour_to else None)
+    except ValueError as e:
+        raise core.DomainError(str(e))
 
 
 @app.get("/api/observations")

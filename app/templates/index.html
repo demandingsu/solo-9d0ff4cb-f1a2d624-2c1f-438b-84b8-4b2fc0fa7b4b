@@ -15,14 +15,17 @@ main { max-width:1080px; margin:18px auto; padding:0 16px 40px; }
 section { background:#fff; border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin-bottom:16px; }
 h2 { font-size:15px; margin:0 0 10px; }
 table { border-collapse:collapse; width:100%; font-size:13px; margin:6px 0; }
-th,td { border:1px solid var(--line); padding:5px 8px; text-align:left; }
+th,td { border:1px solid var(--line); padding:5px 8px; text-align:left; vertical-align:top; }
 th { background:var(--bg); }
 button { background:var(--brand); color:#fff; border:0; border-radius:6px; padding:6px 14px; cursor:pointer; font-size:13px; }
 button.ghost { background:#fff; color:var(--brand); border:1px solid var(--brand); padding:3px 10px; }
 button:hover { opacity:.88; }
 input,select { padding:5px 7px; border:1px solid var(--line); border-radius:6px; font-size:13px; }
+input.prio { width:82px; }
 .badge { display:inline-block; background:var(--ok); color:#fff; font-size:11px; border-radius:10px; padding:1px 8px; margin-left:6px; vertical-align:middle; }
 .badge.old { background:#6e7781; }
+.badge.conflict { background:var(--bad); }
+.badge.prio { background:var(--brand); }
 .ok { color:var(--ok); } .err { color:var(--bad); }
 .msg { margin-top:8px; font-size:13px; }
 .err-list { color:var(--bad); font-size:12px; margin:4px 0 0; }
@@ -32,12 +35,16 @@ code { background:var(--bg); padding:1px 5px; border-radius:4px; }
 details { margin:2px 0 10px; }
 summary { cursor:pointer; }
 .nullcell { color:#9a6700; font-size:12px; }
+tr.conflict-row td { background:#fff5f5; }
+.src { font-size:11px; color:#57606a; }
+.conflict-note { font-size:12px; color:var(--bad); }
+.chip { display:inline-block; border:1px solid var(--line); background:var(--bg); border-radius:10px; padding:0 7px; margin:1px 2px; font-size:11px; }
 </style>
 </head>
 <body>
 <header>
   <h1>环境监测小时观测数据平台</h1>
-  <p>结构版本化：改名 / 新增可空列 / 整数扩小数 可追溯；旧批次保留原值与原结构；删除列、合并列、缩型一律拒绝；失败操作不影响供数。</p>
+  <p>结构版本化 + 批次优先级归并：按站号、UTC 小时逐列取最高优先级非空值；同级同值只算一次，同级异值标冲突、该小时不可交付；原始观测始终可回看。</p>
 </header>
 <main>
 
@@ -56,13 +63,34 @@ summary { cursor:pointer; }
   <p class="muted" id="csv-hint"></p>
   <div class="row">
     <input type="file" id="csv-file" accept=".csv,text/csv">
+    <label>批次优先级 <input id="csv-priority" class="prio" type="number" value="0" step="1"></label>
     <button onclick="uploadCsv()">上传</button>
   </div>
+  <p class="muted">优先级为整数，数值越大越优先（重传 / 补报一般高于原始批次）。上传后用同一优先级、同一读数重传只会合并来源，不会产生冲突。</p>
   <div id="upload-result" class="msg"></div>
 </section>
 
+<section id="sec-merge">
+  <h2>④ 归并结果（每小时一行）</h2>
+  <div class="row">
+    <label>站号 <input id="m-station" placeholder="如 S01（可空）"></label>
+    <label>起始 <input id="m-from" placeholder="2026-11-18T00:00"></label>
+    <label>截止 <input id="m-to" placeholder="2026-11-18T23:00"></label>
+    <label>状态 <select id="m-status">
+      <option value="">全部</option>
+      <option value="ok">可交付</option>
+      <option value="conflict">冲突·不可交付</option>
+    </select></label>
+    <button onclick="doMerge()">查看归并</button>
+    <button class="ghost" onclick="downloadMerged()">下载 CSV</button>
+    <button class="ghost" onclick="recomputeAll()">全量重算</button>
+  </div>
+  <div id="merge-summary" class="msg"></div>
+  <div id="merge-result"></div>
+</section>
+
 <section id="sec-query">
-  <h2>④ 查询观测</h2>
+  <h2>⑤ 原始观测（按批次回看）</h2>
   <div class="row">
     <label>站号 <input id="q-station" placeholder="如 S01（可空）"></label>
     <label>起始 <input id="q-from" placeholder="2026-11-18T00:00"></label>
@@ -73,20 +101,26 @@ summary { cursor:pointer; }
   <div id="query-result"></div>
 </section>
 
+<section id="sec-priorities">
+  <h2>⑥ 批次优先级</h2>
+  <p class="muted">调整后立即在同一事务内重算该批次涉及的小时；其他小时保持不变。原始观测不会被改写。</p>
+  <div id="priorities-box"></div>
+</section>
+
 <section id="sec-versions">
-  <h2>⑤ 版本历史</h2>
+  <h2>⑦ 版本历史</h2>
   <div id="versions-box"></div>
 </section>
 
 <section id="sec-batches">
-  <h2>⑥ 批次列表</h2>
+  <h2>⑧ 批次列表</h2>
   <div id="batches-box"></div>
 </section>
 
 </main>
 <script>
 const $ = id => document.getElementById(id);
-const state = { current: null, versions: [], batches: [] };
+const state = { current: null, versions: [], batches: [], priorities: [] };
 const TYPE_LABEL = { station:'站号(系统)', hour:'UTC小时(系统)', integer:'整数', float:'小数', text:'文本' };
 
 async function api(path, opts){
@@ -108,7 +142,11 @@ async function refresh(){
   try { state.current = await api('/api/versions/current'); } catch(e) { state.current = null; }
   state.versions = (await api('/api/versions')).versions;
   state.batches = (await api('/api/batches')).batches;
-  renderCurrent(); renderPublish(); renderVersions(); renderBatches(); renderLensOptions();
+  try { state.priorities = (await api('/api/batches/priorities')).batches; }
+  catch(e) { state.priorities = []; }
+  renderCurrent(); renderPublish(); renderVersions(); renderBatches();
+  renderLensOptions(); renderPriorities();
+  if(state.current) await doMerge();
 }
 
 function colTable(cols){
@@ -232,9 +270,114 @@ async function uploadCsv(){
   const f = $('csv-file').files[0];
   if(!f){ msg.innerHTML = '<div class="err">请选择 CSV 文件</div>'; return; }
   const fd = new FormData(); fd.append('file', f);
+  fd.append('priority', $('csv-priority').value.trim() || '0');
   try{
     const r = await api('/api/batches', { method:'POST', body: fd });
-    msg.innerHTML = '<div class="ok">✓ 批次 #' + r.batch_id + ' 已按 v' + r.version_no + ' 入库，共 ' + r.row_count + ' 行</div>';
+    msg.innerHTML = '<div class="ok">✓ 批次 #' + r.batch_id + ' 已按 v' + r.version_no +
+      ' 入库，共 ' + r.row_count + ' 行，优先级 ' + r.priority + '；归并结果已重算</div>';
+    await refresh();
+  }catch(e){ showErr(msg, e); }
+}
+
+/* ---------- 归并结果 ---------- */
+
+function mergeParams(){
+  const p = new URLSearchParams();
+  if($('m-station').value.trim()) p.set('station', $('m-station').value.trim());
+  if($('m-from').value.trim()) p.set('hour_from', $('m-from').value.trim());
+  if($('m-to').value.trim()) p.set('hour_to', $('m-to').value.trim());
+  if($('m-status').value) p.set('status', $('m-status').value);
+  return p;
+}
+
+function fmtVal(v, type){
+  if(v === null || v === undefined) return '<span class="nullcell">（空）</span>';
+  if(type === 'text' && String(v).trim() === '') return '<span class="nullcell">（空）</span>';
+  return esc(v);
+}
+
+async function doMerge(){
+  const box = $('merge-result'); const sum = $('merge-summary');
+  box.innerHTML = ''; sum.innerHTML = '';
+  try{
+    const d = await api('/api/merged?' + mergeParams().toString());
+    const dataCols = d.columns.filter(c => c.type !== 'station' && c.type !== 'hour');
+    const conflicts = d.rows.filter(r => !r.deliverable).length;
+    sum.innerHTML = '<p class="muted">现役结构 v' + d.version.version_no + ' · 共 ' + d.row_count +
+      ' 个小时' + (conflicts ? '，其中 <b class="err">' + conflicts + ' 个冲突不可交付</b>' : '，全部可交付') +
+      (d.truncated ? '（已达上限，结果截断）' : '') + '</p>';
+    if(!d.rows.length){ box.innerHTML = '<p class="muted">暂无归并结果，请先上传观测。</p>'; return; }
+    let h = '<table><tr><th>站号</th><th>UTC 小时</th><th>交付状态</th>' +
+      dataCols.map(c => '<th>' + esc(c.name) +
+        '<br><span class="muted">' + TYPE_LABEL[c.type] + '</span><br><span class="src">来源批次·优先级</span></th>').join('') +
+      '<th>冲突原因</th></tr>';
+    d.rows.forEach(r => {
+      h += '<tr class="' + (r.deliverable ? '' : 'conflict-row') + '">' +
+        '<td>' + esc(r.station) + '</td><td>' + esc(r.hour_utc) + '</td>' +
+        '<td>' + (r.deliverable
+          ? '<span class="badge">可交付</span>'
+          : '<span class="badge conflict">冲突·不可交付</span>') + '</td>' +
+        dataCols.map(c => {
+          const src = r.sources[c.name];
+          const chips = src && src.batches && src.batches.length
+            ? '<br><span class="src">' + src.batches.map(b =>
+                '<span class="chip">#' + b.batch_id + ' · P' + b.priority + '</span>').join('') +
+              '</span>'
+            : '';
+          return '<td>' + fmtVal(r.values[c.name], c.type) + chips + '</td>';
+        }).join('') +
+        '<td>' + (r.conflicts.length
+          ? r.conflicts.map(cf => '<div class="conflict-note">' + esc(cf.reason) +
+              '<br>' + cf.candidates.map(x =>
+                '<span class="chip">#' + x.batch_id + ' · ' + esc(x.filename || '') + ' = ' +
+                esc(JSON.stringify(x.value)) + '</span>').join('') + '</div>').join('')
+          : '<span class="muted">—</span>') + '</td>' +
+        '</tr>';
+    });
+    box.innerHTML = h + '</table>';
+  }catch(e){ showErr(box, e); }
+}
+
+function downloadMerged(){
+  window.location = '/api/merged.csv?' + mergeParams().toString();
+}
+
+async function recomputeAll(){
+  const msg = $('merge-summary');
+  try{
+    const r = await api('/api/merge/recompute', { method:'POST' });
+    msg.innerHTML = '<div class="ok">✓ 已全量重算 ' + r.recomputed_hours + ' 个小时</div>';
+    await doMerge();
+  }catch(e){ showErr(msg, e); }
+}
+
+/* ---------- 批次优先级 ---------- */
+
+function renderPriorities(){
+  const box = $('priorities-box');
+  if(!state.priorities.length){ box.innerHTML = '<p class="muted">暂无批次。</p>'; return; }
+  let h = '<table><tr><th>批次</th><th>结构版本</th><th>文件名</th><th>行数</th><th>优先级</th><th>上传时间</th><th></th></tr>';
+  state.priorities.forEach(b => {
+    h += '<tr><td>#' + b.id + '</td><td>v' + b.version_no + '</td><td>' + esc(b.filename) +
+      '</td><td>' + b.row_count + '</td>' +
+      '<td><input class="prio" type="number" step="1" id="prio-' + b.id + '" value="' + b.priority + '">' +
+      ' <span class="badge prio">当前 ' + b.priority + '</span></td>' +
+      '<td>' + esc(b.uploaded_at) + '</td>' +
+      '<td><button class="ghost" onclick="savePriority(' + b.id + ')">保存并重算</button></td></tr>';
+  });
+  box.innerHTML = h + '</table><div id="prio-msg" class="msg"></div>';
+}
+
+async function savePriority(id){
+  const msg = $('prio-msg'); msg.innerHTML = '';
+  const value = $('prio-' + id).value.trim();
+  try{
+    const r = await api('/api/batches/' + id + '/priority', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ priority: value }) });
+    msg.innerHTML = '<div class="ok">✓ 批次 #' + id + ' 优先级 ' +
+      (r.changed ? r.previous_priority + ' → ' + r.priority : '未变（' + r.priority + '）') +
+      '，重算 ' + r.recomputed_hours + ' 个小时</div>';
     await refresh();
   }catch(e){ showErr(msg, e); }
 }
@@ -265,14 +408,11 @@ async function doQuery(){
     let h = '<p class="muted">视角：v' + d.version.version_no + '（' + (d.version.status === 'active' ? '现役' : '历史') +
       '）· 共 ' + d.row_count + ' 行' + (d.truncated ? '（已达上限，结果截断）' : '') + '</p>';
     if(!d.rows.length){ box.innerHTML = h + '<p class="muted">无匹配数据。</p>'; return; }
-    h += '<table><tr><th>批次</th><th>批次版本</th>' +
+    h += '<table><tr><th>批次</th><th>优先级</th><th>批次版本</th>' +
       cols.map(c => '<th>' + esc(c.name) + '<br><span class="muted">' + TYPE_LABEL[c.type] + '</span></th>').join('') + '</tr>';
     d.rows.forEach(r => {
-      h += '<tr><td>#' + r.batch_id + '</td><td>v' + r.batch_version_no + '</td>' +
-        cols.map(c => {
-          const val = r.values[c.name];
-          return '<td>' + (val === null || val === undefined ? '<span class="nullcell">（空）</span>' : esc(val)) + '</td>';
-        }).join('') + '</tr>';
+      h += '<tr><td>#' + r.batch_id + '</td><td>' + (r.priority ?? '') + '</td><td>v' + r.batch_version_no + '</td>' +
+        cols.map(c => '<td>' + fmtVal(r.values[c.name], c.type) + '</td>').join('') + '</tr>';
     });
     box.innerHTML = h + '</table>';
   }catch(e){ showErr(box, e); }
